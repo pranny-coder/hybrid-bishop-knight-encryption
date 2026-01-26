@@ -1,6 +1,7 @@
 import hashlib
 import os
 import random
+import time
 from typing import List, Tuple
 
 # ============================================================
@@ -21,7 +22,6 @@ def XOR(a: bytes, b: bytes) -> bytes:
     return bytes(x ^ y for x, y in zip(a, b))
 
 def split_nibbles(block16: bytes) -> List[int]:
-    # 16 bytes -> 32 nibbles (4-bit values)
     nibbles = []
     for byte in block16:
         nibbles.append((byte >> 4) & 0xF)
@@ -29,7 +29,6 @@ def split_nibbles(block16: bytes) -> List[int]:
     return nibbles
 
 def join_nibbles(nibbles: List[int]) -> bytes:
-    # 32 nibbles -> 16 bytes
     out = bytearray(16)
     for i in range(16):
         hi = nibbles[2*i] & 0xF
@@ -38,7 +37,6 @@ def join_nibbles(nibbles: List[int]) -> bytes:
     return bytes(out)
 
 def bytes_to_bits(block16: bytes) -> List[int]:
-    # 16 bytes -> 128 bits (big endian within each byte)
     bits = []
     for byte in block16:
         for k in range(7, -1, -1):
@@ -46,7 +44,6 @@ def bytes_to_bits(block16: bytes) -> List[int]:
     return bits
 
 def bits_to_bytes(bits: List[int]) -> bytes:
-    # 128 bits -> 16 bytes
     out = bytearray(16)
     for i in range(16):
         v = 0
@@ -60,7 +57,6 @@ def hamming_distance(a: bytes, b: bytes) -> int:
 
 # ============================================================
 # SBOX and inverse SBOX (4-bit)
-# You can replace with your fixed SBOX, but this one is valid.
 # ============================================================
 
 SBOX = [0x6, 0x4, 0xC, 0x5,
@@ -73,9 +69,7 @@ for i, v in enumerate(SBOX):
     INV_SBOX[v] = i
 
 # ============================================================
-# Chess move tables
-# MOVE_K32 : (±3,±2) and (±2,±3)
-# MOVE_B2  : (±2,±2)
+# Chess move tables (fixed: different sets)
 # ============================================================
 
 MOVE_K32 = [
@@ -98,28 +92,20 @@ def BuildMoveTable(deltas: List[Tuple[int, int]]) -> List[List[int]]:
     return table
 
 TABLE_K32 = BuildMoveTable(MOVE_K32)
-TABLE_B2 = BuildMoveTable(MOVE_B2)
+TABLE_B2  = BuildMoveTable(MOVE_B2)
 
 def GetMoves(step_j: int, current_sq: int, mode: int) -> List[int]:
-    # mode = 0 initially, flips when round % 3 == 0
     if mode == 0:
-        if step_j % 2 == 1:
-            return TABLE_K32[current_sq]
-        else:
-            return TABLE_B2[current_sq]
+        return TABLE_K32[current_sq] if (step_j % 2 == 1) else TABLE_B2[current_sq]
     else:
-        if step_j % 2 == 0:
-            return TABLE_K32[current_sq]
-        else:
-            return TABLE_B2[current_sq]
+        return TABLE_K32[current_sq] if (step_j % 2 == 0) else TABLE_B2[current_sq]
 
 # ============================================================
 # 128-bit permutations
-# We generate a list of deterministic permutations.
-# Each perm is perm[0..127], mapping output_bit_index -> input_bit_index
+# perm[out_i] = in_i mapping
 # ============================================================
 
-def generate_permutations(num: int = 128, seed: bytes = b"PERMUTATIONS_SEED") -> List[List[int]]:
+def generate_permutations(num: int = 256, seed: bytes = b"PERMUTATIONS_SEED") -> List[List[int]]:
     perms = []
     base = list(range(128))
     for i in range(num):
@@ -129,7 +115,7 @@ def generate_permutations(num: int = 128, seed: bytes = b"PERMUTATIONS_SEED") ->
         perms.append(p)
     return perms
 
-PERMUTATIONS = generate_permutations(num=256)  # feel free to increase
+PERMUTATIONS = generate_permutations(num=256)
 
 def ApplyPerm(perm: List[int], state16: bytes) -> bytes:
     bits = bytes_to_bits(state16)
@@ -142,15 +128,10 @@ def InversePerm(perm: List[int]) -> List[int]:
     inv = [0] * 128
     for out_i, in_i in enumerate(perm):
         inv[in_i] = out_i
-    # NOTE:
-    # Our perm is output->input mapping.
-    # If ApplyPerm(out)=bits[perm[out]], then inverse should satisfy
-    # ApplyPerm(inv, ApplyPerm(perm, bits)) == bits
-    # The above inv creation works for that.
     return inv
 
 # ============================================================
-# Key schedule init() (from PDF)
+# Key schedule init()
 # ============================================================
 
 def init(K: bytes, N: bytes, R: int, W: int):
@@ -158,8 +139,8 @@ def init(K: bytes, N: bytes, R: int, W: int):
     start_sq = BitsToInt(seed) % 64
     T = FirstBits(seed, 128)
 
-    ROUND_KEY = [None] * (R + 1)   # 1..R
-    ROUND_PERM = [None] * (R + 1)  # 1..R
+    ROUND_KEY  = [None] * (R + 1)
+    ROUND_PERM = [None] * (R + 1)
 
     mode = 0
 
@@ -171,21 +152,17 @@ def init(K: bytes, N: bytes, R: int, W: int):
         walk_bytes = bytearray()
 
         for j in range(1, W + 1):
-            # h = H( K || N || r || j || T )
             h = H(K + N + r.to_bytes(4, "big") + j.to_bytes(4, "big") + T)
 
             moves = GetMoves(j, current_sq, mode)
-
             if not moves:
-                # fallback: union of both
                 moves = list(set(TABLE_K32[current_sq] + TABLE_B2[current_sq]))
 
             idx = BitsToInt(h) % len(moves)
             next_sq = moves[idx]
 
-            delta = current_sq ^ next_sq  # 0..63
+            delta = current_sq ^ next_sq
             walk_bytes.append(delta & 0xFF)
-
             current_sq = next_sq
 
         round_hash = H(K + N + r.to_bytes(4, "big") + bytes(walk_bytes))
@@ -196,115 +173,210 @@ def init(K: bytes, N: bytes, R: int, W: int):
 
     return T, ROUND_KEY, ROUND_PERM
 
+def init_frozen(K: bytes, N: bytes, R: int, W: int):
+    return init(K, N, R, W)
+
 # ============================================================
-# SPN Encrypt / Decrypt (128-bit block)
+# SPN Encrypt / Decrypt
 # ============================================================
 
-def Encrypt(P: bytes, K: bytes, N: bytes, R: int = 10, W: int = 32) -> bytes:
-    assert len(P) == 16, "Plaintext must be exactly 16 bytes (128-bit)"
+def Encrypt(P: bytes, K: bytes, N: bytes, R: int = 20, W: int = 32) -> bytes:
+    assert len(P) == 16
     T, ROUND_KEY, ROUND_PERM = init(K, N, R, W)
 
     STATE = XOR(XOR(P, ROUND_KEY[1]), T)
 
     for r in range(1, R + 1):
         STATE = XOR(STATE, ROUND_KEY[r])
-
-        nibbles = split_nibbles(STATE)
-        nibbles = [SBOX[x] for x in nibbles]
-        STATE = join_nibbles(nibbles)
-
+        STATE = join_nibbles([SBOX[x] for x in split_nibbles(STATE)])
         STATE = ApplyPerm(ROUND_PERM[r], STATE)
 
-    C = XOR(XOR(STATE, ROUND_KEY[R]), T)
-    return C
+    return XOR(XOR(STATE, ROUND_KEY[R]), T)
 
-def Decrypt(C: bytes, K: bytes, N: bytes, R: int = 10, W: int = 32) -> bytes:
-    assert len(C) == 16, "Ciphertext must be exactly 16 bytes (128-bit)"
+def Decrypt(C: bytes, K: bytes, N: bytes, R: int = 20, W: int = 32) -> bytes:
+    assert len(C) == 16
     T, ROUND_KEY, ROUND_PERM = init(K, N, R, W)
 
     STATE = XOR(XOR(C, T), ROUND_KEY[R])
 
     for r in range(R, 0, -1):
-        invp = InversePerm(ROUND_PERM[r])
-        STATE = ApplyPerm(invp, STATE)
-
-        nibbles = split_nibbles(STATE)
-        nibbles = [INV_SBOX[x] for x in nibbles]
-        STATE = join_nibbles(nibbles)
-
+        STATE = ApplyPerm(InversePerm(ROUND_PERM[r]), STATE)
+        STATE = join_nibbles([INV_SBOX[x] for x in split_nibbles(STATE)])
         STATE = XOR(STATE, ROUND_KEY[r])
 
-    P = XOR(XOR(STATE, T), ROUND_KEY[1])
-    return P
+    return XOR(XOR(STATE, T), ROUND_KEY[1])
 
 # ============================================================
-# Encrypt first k rounds (for Avalanche Test)
+# Frozen rounds (metrics)
 # ============================================================
 
-def EncryptKRounds(P: bytes, K: bytes, N: bytes, k: int, R: int = 10, W: int = 32) -> bytes:
-    assert 1 <= k <= R
-    T, ROUND_KEY, ROUND_PERM = init(K, N, R, W)
-
+def EncryptKRoundsFrozen(P: bytes, T: bytes, ROUND_KEY: List[bytes], ROUND_PERM: List[List[int]], k: int) -> bytes:
     STATE = XOR(XOR(P, ROUND_KEY[1]), T)
-
     for r in range(1, k + 1):
         STATE = XOR(STATE, ROUND_KEY[r])
-
-        nibbles = split_nibbles(STATE)
-        nibbles = [SBOX[x] for x in nibbles]
-        STATE = join_nibbles(nibbles)
-
+        STATE = join_nibbles([SBOX[x] for x in split_nibbles(STATE)])
         STATE = ApplyPerm(ROUND_PERM[r], STATE)
-
-    # same final mixing style but only upto k (for consistency in measuring diffusion)
     return STATE
 
-def flip_one_random_bit(block16: bytes) -> bytes:
+def flip_bit(block16: bytes, bitpos: int) -> bytes:
     b = bytearray(block16)
-    bitpos = random.randrange(128)
     byte_i = bitpos // 8
-    bit_i = 7 - (bitpos % 8)
+    bit_i  = 7 - (bitpos % 8)
     b[byte_i] ^= (1 << bit_i)
     return bytes(b)
 
 # ============================================================
-# Avalanche test (from PDF)
+# Avalanche Tests
 # ============================================================
 
-def AvalanchePerRound(R: int = 10, trials: int = 200, W: int = 32):
+def AvalanchePerRound_PureSPN(R: int = 20, trials: int = 200, W: int = 32):
     K = os.urandom(16)
     N = os.urandom(16)
+    T, ROUND_KEY, ROUND_PERM = init_frozen(K, N, R, W)
 
+    print("\nAvalanche Test (PURE SPN diffusion, frozen init):")
     for k in range(1, R + 1):
         total = 0
         for _ in range(trials):
             P = os.urandom(16)
-            C1 = EncryptKRounds(P, K, N, k, R=R, W=W)
-
-            P2 = flip_one_random_bit(P)
-            C2 = EncryptKRounds(P2, K, N, k, R=R, W=W)
-
+            C1 = EncryptKRoundsFrozen(P, T, ROUND_KEY, ROUND_PERM, k)
+            P2 = flip_bit(P, random.randrange(128))
+            C2 = EncryptKRoundsFrozen(P2, T, ROUND_KEY, ROUND_PERM, k)
             total += hamming_distance(C1, C2)
 
-        avg = total / trials
-        print(f"Round {k:2d}: avg flipped bits = {avg:.2f} / 128")
+        print(f"Round {k:2d}: avg flipped bits = {total/trials:.2f} / 128")
 
 # ============================================================
-# Quick Demo
+# BIC Test (lightweight)
+# ============================================================
+
+def compute_correlation(bits1: List[int], bits2: List[int]) -> float:
+    n = len(bits1)
+    mean1 = sum(bits1) / n
+    mean2 = sum(bits2) / n
+    num = sum((bits1[i] - mean1) * (bits2[i] - mean2) for i in range(n))
+    den1 = sum((bits1[i] - mean1) ** 2 for i in range(n))
+    den2 = sum((bits2[i] - mean2) ** 2 for i in range(n))
+    denom = (den1 * den2) ** 0.5
+    if denom == 0:
+        return 0.0
+    return num / denom
+
+def measure_bic(P: bytes, T: bytes, ROUND_KEY: List[bytes], ROUND_PERM: List[List[int]], R: int,
+                trials: int = 40, bits_to_flip: int = 32):
+    bit_positions = random.sample(range(128), bits_to_flip)
+
+    total_corr = 0.0
+    total_pairs = 0
+    max_corr = 0.0
+
+    for _ in range(trials):
+        C1 = EncryptKRoundsFrozen(P, T, ROUND_KEY, ROUND_PERM, R)
+        bits1 = bytes_to_bits(C1)
+
+        for bpos in bit_positions:
+            P2 = flip_bit(P, bpos)
+            C2 = EncryptKRoundsFrozen(P2, T, ROUND_KEY, ROUND_PERM, R)
+            bits2 = bytes_to_bits(C2)
+
+            corr = abs(compute_correlation(bits1, bits2))
+            total_corr += corr
+            max_corr = max(max_corr, corr)
+            total_pairs += 1
+
+    print(f"\nBIC Results (abs correlation): mean = {total_corr/total_pairs:.4f}, max = {max_corr:.4f}")
+
+# ============================================================
+# Correctness + Performance Benchmark (frozen init)
+# ============================================================
+
+def correctness_test(R: int = 20, W: int = 32, tests: int = 200):
+    K = os.urandom(16)
+    N = os.urandom(16)
+    passed = 0
+
+    for _ in range(tests):
+        P = os.urandom(16)
+        C = Encrypt(P, K, N, R=R, W=W)
+        P2 = Decrypt(C, K, N, R=R, W=W)
+        if P2 == P:
+            passed += 1
+
+    print("\nCorrectness Test")
+    print(f"Total tests : {tests}")
+    print(f"Passed      : {passed}")
+    print(f"Accuracy    : {passed/tests*100:.2f}%")
+
+def perf_benchmark(R: int = 20, W: int = 32, trials: int = 2000):
+    K = os.urandom(16)
+    N = os.urandom(16)
+    T, ROUND_KEY, ROUND_PERM = init_frozen(K, N, R, W)
+
+    def encrypt_frozen(P: bytes) -> bytes:
+        STATE = XOR(XOR(P, ROUND_KEY[1]), T)
+        for r in range(1, R + 1):
+            STATE = XOR(STATE, ROUND_KEY[r])
+            STATE = join_nibbles([SBOX[x] for x in split_nibbles(STATE)])
+            STATE = ApplyPerm(ROUND_PERM[r], STATE)
+        return XOR(XOR(STATE, ROUND_KEY[R]), T)
+
+    def decrypt_frozen(C: bytes) -> bytes:
+        STATE = XOR(XOR(C, T), ROUND_KEY[R])
+        for r in range(R, 0, -1):
+            STATE = ApplyPerm(InversePerm(ROUND_PERM[r]), STATE)
+            STATE = join_nibbles([INV_SBOX[x] for x in split_nibbles(STATE)])
+            STATE = XOR(STATE, ROUND_KEY[r])
+        return XOR(XOR(STATE, T), ROUND_KEY[1])
+
+    t0 = time.perf_counter()
+    for _ in range(trials):
+        P = os.urandom(16)
+        _ = encrypt_frozen(P)
+    t1 = time.perf_counter()
+
+    C = encrypt_frozen(os.urandom(16))
+    t2 = time.perf_counter()
+    for _ in range(trials):
+        _ = decrypt_frozen(C)
+    t3 = time.perf_counter()
+
+    enc_time = (t1 - t0) / trials
+    dec_time = (t3 - t2) / trials
+
+    print("\nPerformance Metrics (per 16-byte block, frozen init)")
+    print(f"Rounds (R)           : {R}")
+    print(f"Walk length (W)      : {W}")
+    print(f"Trials               : {trials}")
+    print(f"Avg Encrypt Time     : {enc_time*1000:.6f} ms/block")
+    print(f"Avg Decrypt Time     : {dec_time*1000:.6f} ms/block")
+    print(f"Enc Throughput       : {(16/enc_time)/(1024*1024):.6f} MB/s")
+    print(f"Dec Throughput       : {(16/dec_time)/(1024*1024):.6f} MB/s")
+
+# ============================================================
+# Demo
 # ============================================================
 
 if __name__ == "__main__":
-    K = b"THIS_IS_16_BYTEK"   # 16 bytes
-    N = b"THIS_IS_16_BYTEN"   # 16 bytes
+    R = 20
+    W = 32
 
-    P = b"HelloChessCipher!"  # 16 bytes
+    K = b"THIS_IS_16_BYTEK"
+    N = b"THIS_IS_16_BYTEN"
+    P = b"percysbestbuddyi"
+
     print("Plaintext :", P)
-
-    C = Encrypt(P, K, N, R=10, W=32)
+    C = Encrypt(P, K, N, R=R, W=W)
     print("Ciphertext:", C.hex())
-
-    P2 = Decrypt(C, K, N, R=10, W=32)
+    P2 = Decrypt(C, K, N, R=R, W=W)
     print("Decrypted :", P2)
 
-    print("\nAvalanche Test:")
-    AvalanchePerRound(R=10, trials=100, W=32)
+    correctness_test(R=R, W=W, tests=200)
+    perf_benchmark(R=R, W=W, trials=2000)
+
+    AvalanchePerRound_PureSPN(R=R, trials=80, W=W)
+
+    # BIC quick run
+    K2, N2 = os.urandom(16), os.urandom(16)
+    T, ROUND_KEY, ROUND_PERM = init_frozen(K2, N2, R, W)
+    measure_bic(P=os.urandom(16), T=T, ROUND_KEY=ROUND_KEY, ROUND_PERM=ROUND_PERM, R=R, trials=40, bits_to_flip=32)
+
